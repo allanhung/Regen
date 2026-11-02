@@ -20,6 +20,7 @@ type mockEscalationRepo struct {
 	ackErr         error
 	activeStates   []models.EscalationState
 	incidentStates map[uuid.UUID]*models.EscalationState // keyed by incident_id
+	restarted      int
 }
 
 func newMockEscalationRepo() *mockEscalationRepo {
@@ -117,6 +118,29 @@ func (m *mockEscalationRepo) RecordAcknowledgment(alertID uuid.UUID, by string, 
 	s.AcknowledgedBy = &by
 	s.AcknowledgedVia = &via
 	s.Status = models.EscalationStateAcknowledged
+	return nil
+}
+
+func (m *mockEscalationRepo) RecordIncidentAcknowledgment(incidentID uuid.UUID, by string, via models.AcknowledgmentVia) error {
+	s, ok := m.incidentStates[incidentID]
+	if !ok || !s.IsActive() {
+		return nil
+	}
+	now := time.Now()
+	s.AcknowledgedAt = &now
+	s.AcknowledgedBy = &by
+	s.AcknowledgedVia = &via
+	s.Status = models.EscalationStateAcknowledged
+	return nil
+}
+func (m *mockEscalationRepo) RestartState(alertID uuid.UUID, policyID uuid.UUID) error {
+	s, ok := m.states[alertID]
+	if !ok || s.IsActive() {
+		return nil
+	}
+	s.PolicyID, s.CurrentTierIndex, s.Status = policyID, 0, models.EscalationStatePending
+	s.LastNotifiedAt, s.AcknowledgedAt, s.AcknowledgedBy, s.AcknowledgedVia = nil, nil, nil, nil
+	m.restarted++
 	return nil
 }
 
@@ -724,5 +748,113 @@ func TestEscalationEngine_CompleteIncident_EndsEscalation(t *testing.T) {
 	}
 	if got := repo.incidentStates[incidentID].Status; got != models.EscalationStateCompleted {
 		t.Errorf("Status = %q, want completed", got)
+	}
+}
+
+// pendingStateFixture returns an engine with one pending alert escalation that has a
+// schedule-backed tier, plus the chat mock that records pages.
+func pendingStateFixture(t *testing.T, alert *models.Alert) (*escalationEngine, *mockChatForEscalation, *mockEscalationRepo) {
+	t.Helper()
+	schedID, policyID := uuid.New(), uuid.New()
+	repo := newMockEscalationRepo()
+	repo.policies[policyID] = &models.EscalationPolicy{
+		ID: policyID, Enabled: true,
+		Tiers: []models.EscalationTier{makeTier(policyID, 0, 300, models.EscalationTargetSchedule, &schedID, nil)},
+	}
+	alert.EscalationPolicyID = &policyID
+	state := models.EscalationState{ID: uuid.New(), AlertID: &alert.ID, PolicyID: policyID, Status: models.EscalationStatePending}
+	repo.states[alert.ID] = &state
+	repo.activeStates = []models.EscalationState{state}
+
+	chat := &mockChatForEscalation{}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{onCallUser: "alice"}, chat).(*escalationEngine)
+	engine.alertLookup = func(uuid.UUID) (*models.Alert, error) { return alert, nil }
+	return engine, chat, repo
+}
+
+func TestEscalationEngine_TriggerEscalation_RestartsFinishedState(t *testing.T) {
+	policyID := uuid.New()
+	alertID := uuid.New()
+	now := time.Now()
+	repo := newMockEscalationRepo()
+	repo.policies[policyID] = &models.EscalationPolicy{ID: policyID}
+	repo.createErr = &repository.AlreadyExistsError{Resource: "escalation_state", Field: "alert_id"}
+	repo.states[alertID] = &models.EscalationState{
+		AlertID: &alertID, PolicyID: policyID, CurrentTierIndex: 2,
+		Status: models.EscalationStateCompleted, LastNotifiedAt: &now,
+	}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.TriggerEscalation(&models.Alert{ID: alertID, EscalationPolicyID: &policyID}); err != nil {
+		t.Fatal(err)
+	}
+	st := repo.states[alertID]
+	if repo.restarted != 1 || st.Status != models.EscalationStatePending || st.CurrentTierIndex != 0 || st.LastNotifiedAt != nil {
+		t.Errorf("finished state not restarted: restarted=%d state=%+v", repo.restarted, st)
+	}
+}
+
+func TestEscalationEngine_TriggerEscalation_DoesNotRestartActiveState(t *testing.T) {
+	policyID := uuid.New()
+	alertID := uuid.New()
+	repo := newMockEscalationRepo()
+	repo.policies[policyID] = &models.EscalationPolicy{ID: policyID}
+	repo.createErr = &repository.AlreadyExistsError{Resource: "escalation_state", Field: "alert_id"}
+	repo.states[alertID] = &models.EscalationState{AlertID: &alertID, PolicyID: policyID, CurrentTierIndex: 1, Status: models.EscalationStateNotified}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.TriggerEscalation(&models.Alert{ID: alertID, EscalationPolicyID: &policyID}); err != nil {
+		t.Fatal(err)
+	}
+	if repo.restarted != 0 || repo.states[alertID].CurrentTierIndex != 1 {
+		t.Errorf("active state must be left alone: %+v", repo.states[alertID])
+	}
+}
+
+func TestEscalationEngine_Evaluate_SkipsResolvedAlert(t *testing.T) {
+	alert := &models.Alert{ID: uuid.New(), Status: models.AlertStatusResolved}
+	engine, chat, repo := pendingStateFixture(t, alert)
+
+	if err := engine.EvaluateEscalations(); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.sentDMs) != 0 {
+		t.Errorf("resolved alert must not be paged, got %d DMs", len(chat.sentDMs))
+	}
+	if got := repo.states[alert.ID].Status; got != models.EscalationStateCompleted {
+		t.Errorf("Status = %q, want completed", got)
+	}
+}
+
+func TestEscalationEngine_Evaluate_SkipsAlertOfAcknowledgedIncident(t *testing.T) {
+	alert := &models.Alert{ID: uuid.New(), Status: models.AlertStatusFiring}
+	engine, chat, repo := pendingStateFixture(t, alert)
+	engine.incidentLookup = func(uuid.UUID) (*models.Incident, error) {
+		return &models.Incident{Status: models.IncidentStatusAcknowledged}, nil
+	}
+
+	if err := engine.EvaluateEscalations(); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.sentDMs) != 0 {
+		t.Errorf("alert of an acknowledged incident must not be paged, got %d DMs", len(chat.sentDMs))
+	}
+	if got := repo.states[alert.ID].Status; got != models.EscalationStateAcknowledged {
+		t.Errorf("Status = %q, want acknowledged", got)
+	}
+}
+
+func TestEscalationEngine_Evaluate_PagesFiringAlertWithTriggeredIncident(t *testing.T) {
+	alert := &models.Alert{ID: uuid.New(), Status: models.AlertStatusFiring}
+	engine, chat, _ := pendingStateFixture(t, alert)
+	engine.incidentLookup = func(uuid.UUID) (*models.Incident, error) {
+		return &models.Incident{Status: models.IncidentStatusTriggered}, nil
+	}
+
+	if err := engine.EvaluateEscalations(); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.sentDMs) != 1 {
+		t.Errorf("expected 1 page, got %d", len(chat.sentDMs))
 	}
 }

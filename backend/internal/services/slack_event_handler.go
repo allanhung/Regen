@@ -147,6 +147,7 @@ func (h *SlackEventHandler) handleStatusButton(
 	updated, err := h.incidentService.UpdateIncident(incidentID, &UpdateIncidentParams{
 		Status:    targetStatus,
 		UpdatedBy: h.resolveActorID(callback.User.ID),
+		AckVia:    models.AcknowledgmentViaSlack,
 	})
 	if err != nil {
 		slog.Error("failed to update incident from slack button",
@@ -482,6 +483,7 @@ func (h *SlackEventHandler) ackIncidentInChannel(cmd slack.SlashCommand) {
 	updated, err := h.incidentService.UpdateIncident(incident.ID, &UpdateIncidentParams{
 		Status:    models.IncidentStatusAcknowledged,
 		UpdatedBy: h.resolveActorID(cmd.UserID),
+		AckVia:    models.AcknowledgmentViaSlack,
 	})
 	if err != nil {
 		h.postEphemeral(cmd.ChannelID, cmd.UserID, "Failed to acknowledge: "+err.Error())

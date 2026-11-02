@@ -90,3 +90,14 @@ func TestTeamsCards_ActionButtons(t *testing.T) {
 		}
 	}
 }
+
+func TestTeamsIncidentEscalationCard_HasIncidentButtons(t *testing.T) {
+	id := uuid.New()
+	raw, _ := json.Marshal(TeamsIncidentEscalationCard(id, 1, "https://regen.example.com"))
+	got := string(raw)
+	for _, want := range []string{"Tier 2", "Open Fluidify Regen", "Acknowledge", "Resolve", "Status", id.String()} {
+		if !strings.Contains(got, want) {
+			t.Errorf("card missing %q:\n%s", want, got)
+		}
+	}
+}

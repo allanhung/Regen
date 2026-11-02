@@ -42,9 +42,10 @@ type UpdateIncidentParams struct {
 	Severity    models.IncidentSeverity
 	Summary     string
 	UpdatedBy   string
-	ClientIP    string     // For audit logging
-	AIEnabled   *bool      // Controls whether AI agents process this incident. nil = no change.
-	CommanderID *uuid.UUID // nil = no change
+	ClientIP    string                   // For audit logging
+	AIEnabled   *bool                    // Controls whether AI agents process this incident. nil = no change.
+	CommanderID *uuid.UUID               // nil = no change
+	AckVia      models.AcknowledgmentVia // Channel recorded on escalation when acknowledging; "" = api
 }
 
 // CreateTimelineEntryParams holds parameters for creating a timeline entry
@@ -1223,7 +1224,11 @@ func (s *incidentService) UpdateIncident(id uuid.UUID, params *UpdateIncidentPar
 
 	statusChanged := params.Status != "" && params.Status != previousStatus
 	if statusChanged {
-		s.syncEscalation(id, params.Status, params.UpdatedBy, models.AcknowledgmentViaAPI)
+		via := params.AckVia
+		if via == "" {
+			via = models.AcknowledgmentViaAPI
+		}
+		s.syncEscalation(id, params.Status, params.UpdatedBy, via)
 	}
 
 	// Post Slack notification and optionally archive channel, asynchronously
@@ -1631,6 +1636,13 @@ func (s *incidentService) AcknowledgeIncident(id uuid.UUID, actorType, actorID s
 		"actor":           actorID,
 	})
 	s.syncEscalation(id, models.IncidentStatusAcknowledged, actorID, escalationViaForActor(actorType))
+	// Re-fetch so the refreshed root card shows "acknowledged" and drops its Acknowledge button.
+	if updatedIncident, err := s.incidentRepo.GetByID(context.Background(), id); err == nil && s.teamsSvc != nil {
+		go func() {
+			defer recoverAsyncPanic(context.Background(), "postStatusUpdateToTeams(ack)", "incident_id", id)
+			s.postStatusUpdateToTeams(updatedIncident, incident.Status, models.IncidentStatusAcknowledged, actorID)
+		}()
+	}
 	return nil
 }
 

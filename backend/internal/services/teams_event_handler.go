@@ -174,6 +174,13 @@ func (h *TeamsEventHandler) handleAck(_ context.Context, activity BotActivity) {
 }
 
 func (h *TeamsEventHandler) ackIncident(activity BotActivity, incident *models.Incident) {
+	if incident.Status == models.IncidentStatusAcknowledged {
+		// Already acknowledged, but escalations started since (a new alert grouped into the
+		// incident, a manual escalation) or before the status change was synced may still page.
+		h.ackEscalations(incident, activity.From.ID)
+		h.reply(activity, "⚠️ Incident is already **acknowledged**. Any running escalation has been stopped.")
+		return
+	}
 	if incident.Status != models.IncidentStatusTriggered {
 		h.reply(activity, fmt.Sprintf("⚠️ Incident is already **%s**.", incident.Status))
 		return
@@ -201,8 +208,9 @@ func (h *TeamsEventHandler) handleResolve(_ context.Context, activity BotActivit
 }
 
 func (h *TeamsEventHandler) resolveIncident(activity BotActivity, incident *models.Incident) {
-	if incident.Status == models.IncidentStatusResolved {
-		h.reply(activity, "⚠️ Incident is already resolved.")
+	// Cards in DMs are never refreshed, so their buttons can outlive the incident's state.
+	if incident.Status == models.IncidentStatusResolved || incident.Status == models.IncidentStatusCanceled {
+		h.reply(activity, fmt.Sprintf("⚠️ Incident is already **%s**.", incident.Status))
 		return
 	}
 	if err := h.incidentSvc.ResolveIncident(incident.ID, "teams_bot", activity.From.ID); err != nil {
@@ -236,6 +244,25 @@ func (h *TeamsEventHandler) postStatusCard(activity BotActivity, incident *model
 			"conversation_id", activity.Conversation.ID,
 			"error", err)
 		h.reply(activity, "Failed to retrieve incident status. Please try again.")
+	}
+}
+
+// ackEscalations stops the escalations of an incident's alerts and of the incident itself.
+func (h *TeamsEventHandler) ackEscalations(incident *models.Incident, by string) {
+	if h.escalation == nil {
+		return
+	}
+	alerts, err := h.incidentSvc.GetIncidentAlerts(incident.ID)
+	if err != nil {
+		slog.Error("teams bot: failed to load incident alerts", "incident_id", incident.ID, "error", err)
+	}
+	for _, alert := range alerts {
+		if err := h.escalation.AcknowledgeAlert(alert.ID, by, models.AcknowledgmentViaTeams); err != nil {
+			slog.Error("teams bot: failed to acknowledge alert escalation", "alert_id", alert.ID, "error", err)
+		}
+	}
+	if err := h.escalation.AcknowledgeIncident(incident.ID, by, models.AcknowledgmentViaTeams); err != nil {
+		slog.Error("teams bot: failed to acknowledge incident escalation", "incident_id", incident.ID, "error", err)
 	}
 }
 
@@ -279,6 +306,15 @@ func (h *TeamsEventHandler) handleCardAction(_ context.Context, activity BotActi
 			h.reply(activity, "⚠️ Invalid alert in card action.")
 			return
 		}
+		// Pressing Acknowledge on a page always stops that alert's escalation, whatever
+		// state its incident is in.
+		if v.Action == teamsActionAck && h.escalation != nil {
+			if err := h.escalation.AcknowledgeAlert(alertID, activity.From.ID, models.AcknowledgmentViaTeams); err != nil {
+				slog.Error("teams bot: failed to acknowledge alert", "alert_id", alertID, "error", err)
+				h.reply(activity, "❌ Failed to acknowledge alert. The error has been recorded in system logs.")
+				return
+			}
+		}
 		incident, err = h.incidentRepo.GetIncidentByAlertID(alertID)
 		if err != nil {
 			var nfe *repository.NotFoundError
@@ -290,11 +326,6 @@ func (h *TeamsEventHandler) handleCardAction(_ context.Context, activity BotActi
 			incident = nil
 		}
 		if incident == nil && v.Action == teamsActionAck && h.escalation != nil {
-			if err := h.escalation.AcknowledgeAlert(alertID, activity.From.ID, models.AcknowledgmentViaTeams); err != nil {
-				slog.Error("teams bot: failed to acknowledge alert", "alert_id", alertID, "error", err)
-				h.reply(activity, "❌ Failed to acknowledge alert. The error has been recorded in system logs.")
-				return
-			}
 			h.reply(activity, fmt.Sprintf("🟡 Alert acknowledged by %s", activity.From.Name))
 			return
 		}

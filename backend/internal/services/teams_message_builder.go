@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/FluidifyAI/Regen/backend/internal/models"
+	"github.com/google/uuid"
 )
 
 // Action.Submit payload keys. Teams delivers the data object back to the bot as the
@@ -215,6 +216,15 @@ func TeamsEscalationCard(alert *models.Alert, tierIndex int, appURL string) map[
 		"body":    body,
 		"actions": actions,
 	}
+}
+
+// TeamsIncidentEscalationCard is the page for an incident-sourced escalation, with the
+// incident's Acknowledge / Resolve / Status buttons.
+func TeamsIncidentEscalationCard(incidentID uuid.UUID, tierIndex int, appURL string) map[string]interface{} {
+	card := TeamsEscalationCard(nil, tierIndex, appURL)
+	actions, _ := card["actions"].([]map[string]interface{})
+	card["actions"] = append(actions, teamsActionButtons(incidentID.String(), "", "")...)
+	return card
 }
 
 func teamsAlertSeverityColor(severity string) string {

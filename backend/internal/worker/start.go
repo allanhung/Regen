@@ -68,7 +68,8 @@ func StartAll(ctx context.Context, db *gorm.DB, cfg *config.Config, teamsSvc *se
 	escalationPolicyRepo := repository.NewEscalationPolicyRepository(db)
 	escalationWorker := NewEscalationWorker(workerChatService)
 	escalationEngine := services.NewEscalationEngine(escalationPolicyRepo, scheduleEvaluator, escalationWorker,
-		services.WithAlertRepository(repository.NewAlertRepository(db)))
+		services.WithAlertRepository(repository.NewAlertRepository(db)),
+		services.WithIncidentRepository(repository.NewIncidentRepository(db)))
 	escalationWorker.SetEngine(escalationEngine)
 	if pushSvc != nil {
 		escalationWorker.SetPushService(pushSvc, repository.NewUserRepository(db))
