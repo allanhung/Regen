@@ -161,6 +161,46 @@ func teamsDMCard(incident *models.Incident, appURL string) map[string]interface{
 	}
 }
 
+// teamsResolvedDMCard returns an Adaptive Card for the proactive DM sent to the
+// on-call responder and incident commander when an incident is resolved.
+func teamsResolvedDMCard(incident *models.Incident, resolvedBy, appURL string) map[string]interface{} {
+	return map[string]interface{}{
+		"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+		"type":    "AdaptiveCard",
+		"version": "1.4",
+		"body": []map[string]interface{}{
+			{
+				"type":   "TextBlock",
+				"size":   "Medium",
+				"weight": "Bolder",
+				"text":   "✅ Incident resolved",
+				"wrap":   true,
+			},
+			{
+				"type":   "TextBlock",
+				"size":   "Large",
+				"weight": "Bolder",
+				"text":   fmt.Sprintf("INC-%d: %s", incident.IncidentNumber, incident.Title),
+				"wrap":   true,
+			},
+			{
+				"type": "FactSet",
+				"facts": []map[string]interface{}{
+					{"title": "Severity", "value": string(incident.Severity)},
+					{"title": "Resolved by", "value": resolvedBy},
+				},
+			},
+		},
+		"actions": []map[string]interface{}{
+			{
+				"type":  "Action.OpenUrl",
+				"title": "View Incident",
+				"url":   fmt.Sprintf("%s/incidents/%s", appURL, incident.ID),
+			},
+		},
+	}
+}
+
 // TeamsEscalationCard builds the Adaptive Card sent to someone an escalation has reached.
 // alert is nil for incident-sourced escalations, which get a card without alert details.
 func TeamsEscalationCard(alert *models.Alert, tierIndex int, appURL string) map[string]interface{} {
