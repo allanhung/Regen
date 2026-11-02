@@ -12,13 +12,14 @@ import (
 // ── Mock repository ───────────────────────────────────────────────────────────
 
 type mockEscalationRepo struct {
-	policies     map[uuid.UUID]*models.EscalationPolicy
-	states       map[uuid.UUID]*models.EscalationState // keyed by alert_id
-	createErr    error
-	getStateErr  error
-	updateErr    error
-	ackErr       error
-	activeStates []models.EscalationState
+	policies       map[uuid.UUID]*models.EscalationPolicy
+	states         map[uuid.UUID]*models.EscalationState // keyed by alert_id
+	createErr      error
+	getStateErr    error
+	updateErr      error
+	ackErr         error
+	activeStates   []models.EscalationState
+	incidentStates map[uuid.UUID]*models.EscalationState // keyed by incident_id
 }
 
 func newMockEscalationRepo() *mockEscalationRepo {
@@ -86,6 +87,9 @@ func (m *mockEscalationRepo) GetStateByAlert(alertID uuid.UUID) (*models.Escalat
 	return s, nil
 }
 func (m *mockEscalationRepo) GetStateByIncident(id uuid.UUID) (*models.EscalationState, error) {
+	if st, ok := m.incidentStates[id]; ok {
+		return st, nil
+	}
 	return nil, &repository.NotFoundError{Resource: "escalation_state", ID: id.String()}
 }
 func (m *mockEscalationRepo) GetActiveStates() ([]models.EscalationState, error) {
@@ -653,5 +657,72 @@ func TestEscalationEngine_BothTargetType_NotifiesScheduleAndUsers(t *testing.T) 
 	}
 	if !users["extra-carol"] {
 		t.Error("expected DM to extra-carol (from user list)")
+	}
+}
+
+func TestEscalationEngine_MarkAlertCompleted_KeepsAcknowledged(t *testing.T) {
+	alertID := uuid.New()
+	repo := newMockEscalationRepo()
+	now := time.Now()
+	repo.states[alertID] = &models.EscalationState{
+		AlertID: &alertID, Status: models.EscalationStateAcknowledged, AcknowledgedAt: &now,
+	}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.MarkAlertCompleted(alertID); err != nil {
+		t.Fatal(err)
+	}
+	if got := repo.states[alertID].Status; got != models.EscalationStateAcknowledged {
+		t.Errorf("Status = %q, want acknowledged to be kept", got)
+	}
+}
+
+func TestEscalationEngine_AcknowledgeIncident_StopsIncidentEscalation(t *testing.T) {
+	incidentID := uuid.New()
+	repo := newMockEscalationRepo()
+	repo.incidentStates = map[uuid.UUID]*models.EscalationState{
+		incidentID: {IncidentID: &incidentID, SourceType: "incident", Status: models.EscalationStateNotified},
+	}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.AcknowledgeIncident(incidentID, "u1", models.AcknowledgmentViaTeams); err != nil {
+		t.Fatal(err)
+	}
+	st := repo.incidentStates[incidentID]
+	if st.Status != models.EscalationStateAcknowledged || st.AcknowledgedAt == nil ||
+		st.AcknowledgedVia == nil || *st.AcknowledgedVia != models.AcknowledgmentViaTeams {
+		t.Errorf("state not acknowledged via teams: %+v", st)
+	}
+	if err := engine.AcknowledgeIncident(incidentID, "u2", models.AcknowledgmentViaAPI); err != nil {
+		t.Fatal(err)
+	}
+	if *st.AcknowledgedBy != "u1" {
+		t.Errorf("second ack overwrote the first: by = %q", *st.AcknowledgedBy)
+	}
+}
+
+func TestEscalationEngine_IncidentEscalation_NoStateIsNoop(t *testing.T) {
+	engine := NewEscalationEngine(newMockEscalationRepo(), &mockScheduleEvaluator{}, nil)
+	if err := engine.AcknowledgeIncident(uuid.New(), "u", models.AcknowledgmentViaTeams); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.CompleteIncident(uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEscalationEngine_CompleteIncident_EndsEscalation(t *testing.T) {
+	incidentID := uuid.New()
+	repo := newMockEscalationRepo()
+	repo.incidentStates = map[uuid.UUID]*models.EscalationState{
+		incidentID: {IncidentID: &incidentID, SourceType: "incident", Status: models.EscalationStateNotified},
+	}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.CompleteIncident(incidentID); err != nil {
+		t.Fatal(err)
+	}
+	if got := repo.incidentStates[incidentID].Status; got != models.EscalationStateCompleted {
+		t.Errorf("Status = %q, want completed", got)
 	}
 }

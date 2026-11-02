@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -20,7 +21,8 @@ type TeamsEventHandler struct {
 	incidentRepo repository.IncidentRepository
 	timelineRepo repository.TimelineRepository
 	teamsSvc     *TeamsService
-	appID        string // Bot's Azure App ID — used to filter out self-echoed messages
+	escalation   EscalationEngine // Optional — stops escalations that have no incident
+	appID        string           // Bot's Azure App ID — used to filter out self-echoed messages
 }
 
 // NewTeamsEventHandler creates a handler for inbound Teams Bot Framework activities.
@@ -34,6 +36,10 @@ func NewTeamsEventHandler(appID string, incidentSvc IncidentService, incidentRep
 	}
 }
 
+// SetEscalationEngine wires the escalation engine used when a card button
+// acknowledges an alert that has no incident.
+func (h *TeamsEventHandler) SetEscalationEngine(engine EscalationEngine) { h.escalation = engine }
+
 // BotActivity is a Bot Framework Activity JSON object (simplified subset we use).
 type BotActivity struct {
 	Type         string          `json:"type"`
@@ -45,6 +51,7 @@ type BotActivity struct {
 	Recipient    BotAccount      `json:"recipient"`
 	ServiceURL   string          `json:"serviceUrl"`
 	ChannelData  json.RawMessage `json:"channelData"`
+	Value        json.RawMessage `json:"value"` // Action.Submit data from an Adaptive Card button
 }
 
 type BotConversation struct {
@@ -76,6 +83,11 @@ func (h *TeamsEventHandler) Handle(ctx context.Context, activity BotActivity) {
 func (h *TeamsEventHandler) handleMessage(ctx context.Context, activity BotActivity) {
 	// Ignore messages sent by the bot itself (echo prevention)
 	if strings.EqualFold(activity.From.ID, h.appID) {
+		return
+	}
+
+	if len(activity.Value) > 0 && string(activity.Value) != "null" {
+		h.handleCardAction(ctx, activity)
 		return
 	}
 
@@ -158,6 +170,10 @@ func (h *TeamsEventHandler) handleAck(_ context.Context, activity BotActivity) {
 		h.reply(activity, "⚠️ No incident is linked to this channel.")
 		return
 	}
+	h.ackIncident(activity, incident)
+}
+
+func (h *TeamsEventHandler) ackIncident(activity BotActivity, incident *models.Incident) {
 	if incident.Status != models.IncidentStatusTriggered {
 		h.reply(activity, fmt.Sprintf("⚠️ Incident is already **%s**.", incident.Status))
 		return
@@ -181,6 +197,10 @@ func (h *TeamsEventHandler) handleResolve(_ context.Context, activity BotActivit
 		h.reply(activity, "⚠️ No incident is linked to this channel.")
 		return
 	}
+	h.resolveIncident(activity, incident)
+}
+
+func (h *TeamsEventHandler) resolveIncident(activity BotActivity, incident *models.Incident) {
 	if incident.Status == models.IncidentStatusResolved {
 		h.reply(activity, "⚠️ Incident is already resolved.")
 		return
@@ -204,6 +224,10 @@ func (h *TeamsEventHandler) handleStatus(_ context.Context, activity BotActivity
 		h.reply(activity, "⚠️ No incident is linked to this channel.")
 		return
 	}
+	h.postStatusCard(activity, incident)
+}
+
+func (h *TeamsEventHandler) postStatusCard(activity BotActivity, incident *models.Incident) {
 	card := teamsIncidentCard(incident)
 	msg := Message{Blocks: []interface{}{card}}
 	if _, err := h.teamsSvc.PostToConversation(activity.Conversation.ID, msg); err != nil {
@@ -212,6 +236,83 @@ func (h *TeamsEventHandler) handleStatus(_ context.Context, activity BotActivity
 			"conversation_id", activity.Conversation.ID,
 			"error", err)
 		h.reply(activity, "Failed to retrieve incident status. Please try again.")
+	}
+}
+
+// cardActionValue is the Action.Submit data attached by teamsActionButtons.
+type cardActionValue struct {
+	Action     string `json:"regen_action"`
+	IncidentID string `json:"incident_id"`
+	AlertID    string `json:"alert_id"`
+}
+
+// handleCardAction handles a click on an Acknowledge / Resolve / Status card button.
+// The target comes from the button payload rather than the conversation, so it also
+// works from a 1:1 escalation DM where no incident is linked to the conversation.
+func (h *TeamsEventHandler) handleCardAction(_ context.Context, activity BotActivity) {
+	var v cardActionValue
+	if err := json.Unmarshal(activity.Value, &v); err != nil || v.Action == "" {
+		slog.Warn("teams bot: ignoring unrecognised card action", "conversation_id", activity.Conversation.ID)
+		return
+	}
+
+	var incident *models.Incident
+	switch {
+	case v.IncidentID != "":
+		id, err := uuid.Parse(v.IncidentID)
+		if err != nil {
+			h.reply(activity, "⚠️ Invalid incident in card action.")
+			return
+		}
+		incident, err = h.incidentSvc.GetIncident(id, 0)
+		if err != nil {
+			var nfe *repository.NotFoundError
+			if !errors.As(err, &nfe) {
+				slog.Error("teams bot: failed to load incident for card action", "incident_id", id, "error", err)
+				h.reply(activity, "Internal error. Please try again or check system logs.")
+				return
+			}
+		}
+	case v.AlertID != "":
+		alertID, err := uuid.Parse(v.AlertID)
+		if err != nil {
+			h.reply(activity, "⚠️ Invalid alert in card action.")
+			return
+		}
+		incident, err = h.incidentRepo.GetIncidentByAlertID(alertID)
+		if err != nil {
+			var nfe *repository.NotFoundError
+			if !errors.As(err, &nfe) {
+				slog.Error("teams bot: failed to load incident for alert", "alert_id", alertID, "error", err)
+				h.reply(activity, "Internal error. Please try again or check system logs.")
+				return
+			}
+			incident = nil
+		}
+		if incident == nil && v.Action == teamsActionAck && h.escalation != nil {
+			if err := h.escalation.AcknowledgeAlert(alertID, activity.From.ID, models.AcknowledgmentViaTeams); err != nil {
+				slog.Error("teams bot: failed to acknowledge alert", "alert_id", alertID, "error", err)
+				h.reply(activity, "❌ Failed to acknowledge alert. The error has been recorded in system logs.")
+				return
+			}
+			h.reply(activity, fmt.Sprintf("🟡 Alert acknowledged by %s", activity.From.Name))
+			return
+		}
+	}
+	if incident == nil {
+		h.reply(activity, "⚠️ No incident is linked to this action.")
+		return
+	}
+
+	switch v.Action {
+	case teamsActionAck:
+		h.ackIncident(activity, incident)
+	case teamsActionResolve:
+		h.resolveIncident(activity, incident)
+	case teamsActionStatus:
+		h.postStatusCard(activity, incident)
+	default:
+		slog.Warn("teams bot: unknown card action", "action", v.Action)
 	}
 }
 

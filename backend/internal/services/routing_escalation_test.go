@@ -6,6 +6,7 @@ package services
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/FluidifyAI/Regen/backend/internal/models"
 	"github.com/FluidifyAI/Regen/backend/internal/models/webhooks"
@@ -92,6 +93,7 @@ func TestRoutingEngine_DefaultDecision_NoEscalationPolicyID(t *testing.T) {
 type mockEscalationEngine struct {
 	triggered  []uuid.UUID // alert IDs that had TriggerEscalation called
 	triggerErr error
+	completed  []uuid.UUID // alert IDs that had MarkAlertCompleted called
 }
 
 func (m *mockEscalationEngine) TriggerIncidentEscalation(_ uuid.UUID, _ uuid.UUID) error { return nil }
@@ -106,7 +108,14 @@ func (m *mockEscalationEngine) EvaluateEscalations() error { return nil }
 func (m *mockEscalationEngine) AcknowledgeAlert(id uuid.UUID, by string, via models.AcknowledgmentVia) error {
 	return nil
 }
-func (m *mockEscalationEngine) MarkAlertCompleted(id uuid.UUID) error { return nil }
+func (m *mockEscalationEngine) MarkAlertCompleted(id uuid.UUID) error {
+	m.completed = append(m.completed, id)
+	return nil
+}
+func (m *mockEscalationEngine) AcknowledgeIncident(_ uuid.UUID, _ string, _ models.AcknowledgmentVia) error {
+	return nil
+}
+func (m *mockEscalationEngine) CompleteIncident(_ uuid.UUID) error { return nil }
 
 var _ EscalationEngine = &mockEscalationEngine{}
 
@@ -238,5 +247,44 @@ func TestAlertService_EscalationEngineNil_DoesNotPanic(t *testing.T) {
 	normalized := makeNormalizedAlert("prometheus", "critical")
 	if _, err := svc.ProcessNormalizedAlerts(context.Background(), []webhooks.NormalizedAlert{normalized}); err != nil {
 		t.Fatalf("should not error when escalation engine is nil: %v", err)
+	}
+}
+
+func TestAlertService_ResolvedWebhook_CompletesEscalation(t *testing.T) {
+	existing := &models.Alert{
+		ID: uuid.New(), Source: "prometheus", ExternalID: "fp-1",
+		Status: models.AlertStatusFiring, Severity: models.AlertSeverityCritical,
+	}
+	escalation := &mockEscalationEngine{}
+	svc := NewAlertService(&mockAlertRepository{existingAlert: existing}, &mockIncidentService{shouldCreate: true})
+	svc.SetEscalationEngine(escalation)
+
+	resolved := makeNormalizedAlert("prometheus", "critical")
+	resolved.ExternalID = "fp-1"
+	resolved.Status = "resolved"
+	now := time.Now()
+	resolved.EndedAt = &now
+
+	if _, err := svc.ProcessNormalizedAlerts(context.Background(), []webhooks.NormalizedAlert{resolved}); err != nil {
+		t.Fatalf("ProcessNormalizedAlerts failed: %v", err)
+	}
+	if len(escalation.completed) != 1 || escalation.completed[0] != existing.ID {
+		t.Fatalf("completed = %v, want [%s]", escalation.completed, existing.ID)
+	}
+}
+
+func TestAlertService_FiringWebhook_DoesNotCompleteEscalation(t *testing.T) {
+	existing := &models.Alert{ID: uuid.New(), Source: "prometheus", ExternalID: "fp-2", Status: models.AlertStatusFiring}
+	escalation := &mockEscalationEngine{}
+	svc := NewAlertService(&mockAlertRepository{existingAlert: existing}, &mockIncidentService{})
+	svc.SetEscalationEngine(escalation)
+
+	firing := makeNormalizedAlert("prometheus", "critical")
+	firing.ExternalID = "fp-2"
+	if _, err := svc.ProcessNormalizedAlerts(context.Background(), []webhooks.NormalizedAlert{firing}); err != nil {
+		t.Fatal(err)
+	}
+	if len(escalation.completed) != 0 {
+		t.Fatalf("firing update must not complete escalation, got %v", escalation.completed)
 	}
 }

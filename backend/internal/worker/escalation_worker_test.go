@@ -34,6 +34,10 @@ func (m *mockEscalationEngineForWorker) AcknowledgeAlert(id uuid.UUID, by string
 	return nil
 }
 func (m *mockEscalationEngineForWorker) MarkAlertCompleted(id uuid.UUID) error { return nil }
+func (m *mockEscalationEngineForWorker) AcknowledgeIncident(_ uuid.UUID, _ string, _ models.AcknowledgmentVia) error {
+	return nil
+}
+func (m *mockEscalationEngineForWorker) CompleteIncident(_ uuid.UUID) error { return nil }
 
 var _ services.EscalationEngine = &mockEscalationEngineForWorker{}
 

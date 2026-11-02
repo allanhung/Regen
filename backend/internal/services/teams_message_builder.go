@@ -6,6 +6,45 @@ import (
 	"github.com/FluidifyAI/Regen/backend/internal/models"
 )
 
+// Action.Submit payload keys. Teams delivers the data object back to the bot as the
+// "value" of a message activity, handled by TeamsEventHandler.handleCardAction.
+const (
+	teamsCardActionKey = "regen_action"
+	teamsActionAck     = "ack"
+	teamsActionResolve = "resolve"
+	teamsActionStatus  = "status"
+)
+
+// teamsActionButtons builds the Acknowledge / Resolve / Status buttons for a card.
+// Either incidentID or alertID identifies the target; the handler resolves an alert to
+// its linked incident. A status of "" shows every button (state unknown at render time).
+func teamsActionButtons(incidentID, alertID, status string) []map[string]interface{} {
+	button := func(title, action, style string) map[string]interface{} {
+		data := map[string]interface{}{teamsCardActionKey: action}
+		if incidentID != "" {
+			data["incident_id"] = incidentID
+		}
+		if alertID != "" {
+			data["alert_id"] = alertID
+		}
+		b := map[string]interface{}{"type": "Action.Submit", "title": title, "data": data}
+		if style != "" {
+			b["style"] = style
+		}
+		return b
+	}
+
+	terminal := status == string(models.IncidentStatusResolved) || status == string(models.IncidentStatusCanceled)
+	var buttons []map[string]interface{}
+	if status == "" || status == string(models.IncidentStatusTriggered) {
+		buttons = append(buttons, button("Acknowledge", teamsActionAck, "positive"))
+	}
+	if !terminal {
+		buttons = append(buttons, button("Resolve", teamsActionResolve, ""))
+	}
+	return append(buttons, button("Status", teamsActionStatus, ""))
+}
+
 // teamsIncidentCard returns an Adaptive Card payload (as a Go map, to be JSON-serialised
 // when posting via Graph API) representing the current incident state.
 // The card is designed to show the same key information as the Slack incident card.
@@ -47,6 +86,7 @@ func teamsIncidentCard(incident *models.Incident) map[string]interface{} {
 		"type":    "AdaptiveCard",
 		"version": "1.4",
 		"body":    body,
+		"actions": teamsActionButtons(incident.ID.String(), "", string(incident.Status)),
 	}
 }
 
@@ -110,13 +150,13 @@ func teamsDMCard(incident *models.Incident, appURL string) map[string]interface{
 				},
 			},
 		},
-		"actions": []map[string]interface{}{
+		"actions": append([]map[string]interface{}{
 			{
 				"type":  "Action.OpenUrl",
 				"title": "View Incident",
 				"url":   incidentURL,
 			},
-		},
+		}, teamsActionButtons(incident.ID.String(), "", string(incident.Status))...),
 	}
 }
 
@@ -165,6 +205,7 @@ func TeamsEscalationCard(alert *models.Alert, tierIndex int, appURL string) map[
 		actions = append(actions, map[string]interface{}{
 			"type": "Action.OpenUrl", "title": "View Alert", "url": fmt.Sprintf("%s/alerts/%s", appURL, alert.ID),
 		})
+		actions = append(actions, teamsActionButtons("", alert.ID.String(), "")...)
 	}
 
 	return map[string]interface{}{

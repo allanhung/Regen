@@ -35,6 +35,10 @@ type EscalationEngine interface {
 	EvaluateEscalations() error
 	AcknowledgeAlert(alertID uuid.UUID, by string, via models.AcknowledgmentVia) error
 	MarkAlertCompleted(alertID uuid.UUID) error
+	// AcknowledgeIncident / CompleteIncident do the same for escalations
+	// started on an incident (source_type = incident).
+	AcknowledgeIncident(incidentID uuid.UUID, by string, via models.AcknowledgmentVia) error
+	CompleteIncident(incidentID uuid.UUID) error
 }
 
 // AlertLookupFunc retrieves an alert by ID; injected for testing.
@@ -368,7 +372,52 @@ func (e *escalationEngine) MarkAlertCompleted(alertID uuid.UUID) error {
 		}
 		return fmt.Errorf("failed to get escalation state: %w", err)
 	}
+	if !state.IsActive() {
+		return nil // already acknowledged or completed — keep that outcome
+	}
 	return e.markCompleted(state)
+}
+
+// AcknowledgeIncident stops an incident-sourced escalation. Idempotent; a no-op
+// when the incident has no escalation or it already ended.
+func (e *escalationEngine) AcknowledgeIncident(incidentID uuid.UUID, by string, via models.AcknowledgmentVia) error {
+	state, err := e.incidentState(incidentID)
+	if err != nil || state == nil || !state.IsActive() {
+		return err
+	}
+	now := time.Now()
+	state.AcknowledgedAt = &now
+	state.AcknowledgedBy = &by
+	state.AcknowledgedVia = &via
+	state.Status = models.EscalationStateAcknowledged
+	if err := e.repo.UpdateState(state); err != nil {
+		return fmt.Errorf("failed to acknowledge incident escalation: %w", err)
+	}
+	slog.Info("incident escalation acknowledged", "incident_id", incidentID, "by", by, "via", via)
+	return nil
+}
+
+// CompleteIncident ends an incident-sourced escalation because the incident
+// closed. A no-op when the incident has no escalation or it already ended.
+func (e *escalationEngine) CompleteIncident(incidentID uuid.UUID) error {
+	state, err := e.incidentState(incidentID)
+	if err != nil || state == nil || !state.IsActive() {
+		return err
+	}
+	return e.markCompleted(state)
+}
+
+// incidentState returns (nil, nil) when the incident has no escalation state.
+func (e *escalationEngine) incidentState(incidentID uuid.UUID) (*models.EscalationState, error) {
+	state, err := e.repo.GetStateByIncident(incidentID)
+	if err != nil {
+		var notFound *repository.NotFoundError
+		if errors.As(err, &notFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get incident escalation state: %w", err)
+	}
+	return state, nil
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

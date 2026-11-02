@@ -103,6 +103,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB, cfg *config.Config, appVersion
 	incidentSvc := services.NewIncidentService(incidentRepo, timelineRepo, alertRepo, chatService, db)
 	services.SetAIService(incidentSvc, aiSvc)
 	services.SetCommanderDeps(incidentSvc, userRepo, scheduleRepo, scheduleEvaluator)
+	services.SetEscalationEngine(incidentSvc, escalationEngine)
 	alertSvc := services.NewAlertService(alertRepo, incidentSvc)
 	alertSvc.SetGroupingEngine(groupingEngine)
 	alertSvc.SetRoutingEngine(routingEngine)
@@ -245,6 +246,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB, cfg *config.Config, appVersion
 			// Configure this URL as the bot endpoint in your Azure Bot registration.
 			if teamsSvc != nil {
 				teamsEventHandler := services.NewTeamsEventHandler(cfg.TeamsAppID, incidentSvc, incidentRepo, timelineRepo, teamsSvc)
+				teamsEventHandler.SetEscalationEngine(escalationEngine)
 				teamsGroup := webhooksGroup.Group("/teams", middleware.TeamsAuth(cfg.TeamsAppID))
 				teamsGroup.POST("", handlers.TeamsWebhook(teamsEventHandler))
 			}

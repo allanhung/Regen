@@ -56,3 +56,37 @@ func TestSendDirectMessage_SendsTeamsCardWhenSet(t *testing.T) {
 		t.Error("card activity should not also carry text")
 	}
 }
+
+func TestTeamsCards_ActionButtons(t *testing.T) {
+	alertID := uuid.New()
+	incident := &models.Incident{ID: uuid.New(), Status: models.IncidentStatusTriggered, Severity: models.IncidentSeverityHigh}
+
+	cases := map[string]struct {
+		card map[string]interface{}
+		want []string
+		not  []string
+	}{
+		"escalation": {TeamsEscalationCard(&models.Alert{ID: alertID}, 0, "https://x"), []string{"Acknowledge", "Resolve", "Status", alertID.String()}, nil},
+		"incident":   {teamsIncidentCard(incident), []string{"Acknowledge", "Resolve", "Status", incident.ID.String()}, nil},
+		"dm":         {teamsDMCard(incident, "https://x"), []string{"Acknowledge", "Resolve", "Status", "View Incident"}, nil},
+		"acked":      {teamsIncidentCard(&models.Incident{ID: uuid.New(), Status: models.IncidentStatusAcknowledged}), []string{"Resolve", "Status"}, []string{"Acknowledge"}},
+		"resolved":   {teamsIncidentCard(&models.Incident{ID: uuid.New(), Status: models.IncidentStatusResolved}), []string{"Status"}, []string{"Acknowledge", `"Resolve"`}},
+	}
+	for name, tc := range cases {
+		raw, _ := json.Marshal(tc.card)
+		got := string(raw)
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s card missing %q:\n%s", name, w, got)
+			}
+		}
+		for _, w := range tc.not {
+			if strings.Contains(got, w) {
+				t.Errorf("%s card should not contain %q:\n%s", name, w, got)
+			}
+		}
+		if !strings.Contains(got, "Action.Submit") {
+			t.Errorf("%s card has no Action.Submit", name)
+		}
+	}
+}
