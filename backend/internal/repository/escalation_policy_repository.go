@@ -81,6 +81,14 @@ type EscalationPolicyRepository interface {
 	// the alert's acknowledgment_status in a single transaction.
 	RecordAcknowledgment(alertID uuid.UUID, by string, via models.AcknowledgmentVia) error
 
+	// RecordIncidentAcknowledgment acknowledges the still-active escalation of an
+	// incident (source_type = incident). A no-op when none is active.
+	RecordIncidentAcknowledgment(incidentID uuid.UUID, by string, via models.AcknowledgmentVia) error
+
+	// RestartState puts a finished (acknowledged or completed) alert escalation
+	// back to pending so a re-fired alert pages again. A no-op while it is active.
+	RestartState(alertID uuid.UUID, policyID uuid.UUID) error
+
 	// ListSeverityRules returns all severity → policy mappings.
 	ListSeverityRules() ([]models.EscalationSeverityRule, error)
 
@@ -345,20 +353,27 @@ func (r *escalationPolicyRepository) GetActiveStates() ([]models.EscalationState
 // UpdateState persists changes to an escalation state (tier index, timestamps,
 // status).
 func (r *escalationPolicyRepository) UpdateState(state *models.EscalationState) error {
+	// Progress only. Acknowledgment columns are written by the Record* methods, and the
+	// row must still be active: a caller holding a stale copy (the worker pages for
+	// seconds between reading and writing) must not undo an acknowledgment or completion.
 	err := r.db.Model(state).
+		Where("acknowledged_at IS NULL AND status IN ?", activeStateStatuses).
 		Select(
 			"current_tier_index",
 			"status",
 			"last_notified_at",
-			"acknowledged_at",
-			"acknowledged_by",
-			"acknowledged_via",
 		).
 		Updates(state).Error
 	if err != nil {
 		return fmt.Errorf("failed to update escalation state: %w", err)
 	}
 	return nil
+}
+
+// activeStateStatuses are the escalation statuses that can still page someone.
+var activeStateStatuses = []string{
+	string(models.EscalationStatePending),
+	string(models.EscalationStateNotified),
 }
 
 // RecordAcknowledgment marks the escalation state acknowledged and updates
@@ -374,7 +389,7 @@ func (r *escalationPolicyRepository) RecordAcknowledgment(
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		// Update escalation state.
 		result := tx.Model(&models.EscalationState{}).
-			Where("alert_id = ? AND acknowledged_at IS NULL", alertID).
+			Where("alert_id = ? AND acknowledged_at IS NULL AND status IN ?", alertID, activeStateStatuses).
 			Updates(map[string]interface{}{
 				"acknowledged_at":  now,
 				"acknowledged_by":  by,
@@ -398,6 +413,57 @@ func (r *escalationPolicyRepository) RecordAcknowledgment(
 			return fmt.Errorf("failed to update alert acknowledgment_status: %w", err)
 		}
 
+		return nil
+	})
+}
+
+// RecordIncidentAcknowledgment marks the active escalation of an incident acknowledged.
+func (r *escalationPolicyRepository) RecordIncidentAcknowledgment(
+	incidentID uuid.UUID,
+	by string,
+	via models.AcknowledgmentVia,
+) error {
+	err := r.db.Model(&models.EscalationState{}).
+		Where("incident_id = ? AND source_type = 'incident' AND acknowledged_at IS NULL AND status IN ?",
+			incidentID, activeStateStatuses).
+		Updates(map[string]interface{}{
+			"acknowledged_at":  time.Now(),
+			"acknowledged_by":  by,
+			"acknowledged_via": string(via),
+			"status":           string(models.EscalationStateAcknowledged),
+		}).Error
+	if err != nil {
+		return fmt.Errorf("failed to acknowledge incident escalation state: %w", err)
+	}
+	return nil
+}
+
+// RestartState resets a finished alert escalation to pending and clears the alert's
+// acknowledgment_status, in one transaction.
+func (r *escalationPolicyRepository) RestartState(alertID uuid.UUID, policyID uuid.UUID) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.EscalationState{}).
+			Where("alert_id = ? AND status IN ?", alertID,
+				[]string{string(models.EscalationStateAcknowledged), string(models.EscalationStateCompleted)}).
+			Updates(map[string]interface{}{
+				"policy_id":          policyID,
+				"current_tier_index": 0,
+				"status":             string(models.EscalationStatePending),
+				"last_notified_at":   nil,
+				"acknowledged_at":    nil,
+				"acknowledged_by":    nil,
+				"acknowledged_via":   nil,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("failed to restart escalation state: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
+		if err := tx.Model(&models.Alert{}).Where("id = ?", alertID).
+			Update("acknowledgment_status", string(models.AcknowledgmentStatusPending)).Error; err != nil {
+			return fmt.Errorf("failed to reset alert acknowledgment_status: %w", err)
+		}
 		return nil
 	})
 }

@@ -35,7 +35,21 @@ type EscalationEngine interface {
 	EvaluateEscalations() error
 	AcknowledgeAlert(alertID uuid.UUID, by string, via models.AcknowledgmentVia) error
 	MarkAlertCompleted(alertID uuid.UUID) error
+	// AcknowledgeIncident / CompleteIncident do the same for escalations
+	// started on an incident (source_type = incident).
+	AcknowledgeIncident(incidentID uuid.UUID, by string, via models.AcknowledgmentVia) error
+	CompleteIncident(incidentID uuid.UUID) error
 }
+
+// IncidentEscalationNotifier is implemented by notifiers that can page for an
+// incident-sourced escalation with the incident attached (so the page can offer
+// Acknowledge / Resolve buttons). Notifiers without it receive alert == nil.
+type IncidentEscalationNotifier interface {
+	SendIncidentEscalationDM(userID string, incidentID uuid.UUID, tierIndex int) error
+}
+
+// IncidentLookupFunc returns the incident an alert is linked to, preferring an active one.
+type IncidentLookupFunc func(alertID uuid.UUID) (*models.Incident, error)
 
 // AlertLookupFunc retrieves an alert by ID; injected for testing.
 type AlertLookupFunc func(id uuid.UUID) (*models.Alert, error)
@@ -46,6 +60,8 @@ type escalationEngine struct {
 	evaluator   ScheduleEvaluator
 	notifier    EscalationNotifier
 	alertLookup AlertLookupFunc // set by WithAlertRepository or tests; nil returns an ID-only placeholder
+
+	incidentLookup IncidentLookupFunc // optional; set by WithIncidentRepository
 }
 
 // EscalationEngineOption configures optional parts of the engine.
@@ -57,6 +73,14 @@ type EscalationEngineOption func(*escalationEngine)
 func WithAlertRepository(repo repository.AlertRepository) EscalationEngineOption {
 	return func(e *escalationEngine) {
 		e.alertLookup = repo.GetByID
+	}
+}
+
+// WithIncidentRepository lets the engine see the incident an alert belongs to, so a page is
+// not sent for an alert whose incident was already acknowledged.
+func WithIncidentRepository(repo repository.IncidentRepository) EscalationEngineOption {
+	return func(e *escalationEngine) {
+		e.incidentLookup = repo.GetIncidentByAlertID
 	}
 }
 
@@ -105,9 +129,13 @@ func (e *escalationEngine) TriggerEscalation(alert *models.Alert) error {
 	}
 
 	if err := e.repo.CreateState(state); err != nil {
-		// Already-exists is acceptable (idempotent trigger).
+		// Already-exists is acceptable (idempotent trigger). A finished escalation is
+		// restarted: the alert fired again and has a new incident to page for.
 		var alreadyExists *repository.AlreadyExistsError
 		if errors.As(err, &alreadyExists) {
+			if err := e.repo.RestartState(alertID, *alert.EscalationPolicyID); err != nil {
+				return fmt.Errorf("failed to restart escalation state: %w", err)
+			}
 			return nil
 		}
 		return fmt.Errorf("failed to create escalation state: %w", err)
@@ -208,6 +236,19 @@ func (e *escalationEngine) processState(state *models.EscalationState, policyByI
 		}
 	}
 
+	// Safety nets for effects that ran out of order or never ran: do not page for an
+	// alert that already resolved, or whose incident was already acknowledged.
+	if alert != nil && state.AlertID != nil {
+		if alert.Status == models.AlertStatusResolved {
+			return e.markCompleted(state)
+		}
+		if e.incidentLookup != nil {
+			if incident, err := e.incidentLookup(*state.AlertID); err == nil && incident.Status == models.IncidentStatusAcknowledged {
+				return e.repo.RecordAcknowledgment(*state.AlertID, "incident", models.AcknowledgmentViaAPI)
+			}
+		}
+	}
+
 	// Pending state: notify tier 0 now (possibly skipping to next if empty).
 	if state.Status == models.EscalationStatePending {
 		return e.notifyTier(state, policy, alert)
@@ -279,7 +320,13 @@ func (e *escalationEngine) notifyTier(
 			// Found a tier with targets — send DMs and record notification.
 			for _, userID := range targets {
 				if e.notifier != nil {
-					if err := e.notifier.SendEscalationDM(userID, alert, state.CurrentTierIndex); err != nil {
+					var err error
+					if incidentNotifier, ok := e.notifier.(IncidentEscalationNotifier); ok && alert == nil && state.IncidentID != nil {
+						err = incidentNotifier.SendIncidentEscalationDM(userID, *state.IncidentID, state.CurrentTierIndex)
+					} else {
+						err = e.notifier.SendEscalationDM(userID, alert, state.CurrentTierIndex)
+					}
+					if err != nil {
 						slog.Error("failed to send escalation DM",
 							"user_id", userID,
 							"alert_id", state.AlertID,
@@ -368,7 +415,43 @@ func (e *escalationEngine) MarkAlertCompleted(alertID uuid.UUID) error {
 		}
 		return fmt.Errorf("failed to get escalation state: %w", err)
 	}
+	if !state.IsActive() {
+		return nil // already acknowledged or completed — keep that outcome
+	}
 	return e.markCompleted(state)
+}
+
+// AcknowledgeIncident stops an incident-sourced escalation. Idempotent; a no-op
+// when the incident has no escalation or it already ended.
+func (e *escalationEngine) AcknowledgeIncident(incidentID uuid.UUID, by string, via models.AcknowledgmentVia) error {
+	if err := e.repo.RecordIncidentAcknowledgment(incidentID, by, via); err != nil {
+		return fmt.Errorf("failed to acknowledge incident escalation: %w", err)
+	}
+	slog.Info("incident escalation acknowledged", "incident_id", incidentID, "by", by, "via", via)
+	return nil
+}
+
+// CompleteIncident ends an incident-sourced escalation because the incident
+// closed. A no-op when the incident has no escalation or it already ended.
+func (e *escalationEngine) CompleteIncident(incidentID uuid.UUID) error {
+	state, err := e.incidentState(incidentID)
+	if err != nil || state == nil || !state.IsActive() {
+		return err
+	}
+	return e.markCompleted(state)
+}
+
+// incidentState returns (nil, nil) when the incident has no escalation state.
+func (e *escalationEngine) incidentState(incidentID uuid.UUID) (*models.EscalationState, error) {
+	state, err := e.repo.GetStateByIncident(incidentID)
+	if err != nil {
+		var notFound *repository.NotFoundError
+		if errors.As(err, &notFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get incident escalation state: %w", err)
+	}
+	return state, nil
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

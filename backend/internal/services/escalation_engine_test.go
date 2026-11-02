@@ -12,13 +12,15 @@ import (
 // ── Mock repository ───────────────────────────────────────────────────────────
 
 type mockEscalationRepo struct {
-	policies     map[uuid.UUID]*models.EscalationPolicy
-	states       map[uuid.UUID]*models.EscalationState // keyed by alert_id
-	createErr    error
-	getStateErr  error
-	updateErr    error
-	ackErr       error
-	activeStates []models.EscalationState
+	policies       map[uuid.UUID]*models.EscalationPolicy
+	states         map[uuid.UUID]*models.EscalationState // keyed by alert_id
+	createErr      error
+	getStateErr    error
+	updateErr      error
+	ackErr         error
+	activeStates   []models.EscalationState
+	incidentStates map[uuid.UUID]*models.EscalationState // keyed by incident_id
+	restarted      int
 }
 
 func newMockEscalationRepo() *mockEscalationRepo {
@@ -86,6 +88,9 @@ func (m *mockEscalationRepo) GetStateByAlert(alertID uuid.UUID) (*models.Escalat
 	return s, nil
 }
 func (m *mockEscalationRepo) GetStateByIncident(id uuid.UUID) (*models.EscalationState, error) {
+	if st, ok := m.incidentStates[id]; ok {
+		return st, nil
+	}
 	return nil, &repository.NotFoundError{Resource: "escalation_state", ID: id.String()}
 }
 func (m *mockEscalationRepo) GetActiveStates() ([]models.EscalationState, error) {
@@ -113,6 +118,29 @@ func (m *mockEscalationRepo) RecordAcknowledgment(alertID uuid.UUID, by string, 
 	s.AcknowledgedBy = &by
 	s.AcknowledgedVia = &via
 	s.Status = models.EscalationStateAcknowledged
+	return nil
+}
+
+func (m *mockEscalationRepo) RecordIncidentAcknowledgment(incidentID uuid.UUID, by string, via models.AcknowledgmentVia) error {
+	s, ok := m.incidentStates[incidentID]
+	if !ok || !s.IsActive() {
+		return nil
+	}
+	now := time.Now()
+	s.AcknowledgedAt = &now
+	s.AcknowledgedBy = &by
+	s.AcknowledgedVia = &via
+	s.Status = models.EscalationStateAcknowledged
+	return nil
+}
+func (m *mockEscalationRepo) RestartState(alertID uuid.UUID, policyID uuid.UUID) error {
+	s, ok := m.states[alertID]
+	if !ok || s.IsActive() {
+		return nil
+	}
+	s.PolicyID, s.CurrentTierIndex, s.Status = policyID, 0, models.EscalationStatePending
+	s.LastNotifiedAt, s.AcknowledgedAt, s.AcknowledgedBy, s.AcknowledgedVia = nil, nil, nil, nil
+	m.restarted++
 	return nil
 }
 
@@ -653,5 +681,180 @@ func TestEscalationEngine_BothTargetType_NotifiesScheduleAndUsers(t *testing.T) 
 	}
 	if !users["extra-carol"] {
 		t.Error("expected DM to extra-carol (from user list)")
+	}
+}
+
+func TestEscalationEngine_MarkAlertCompleted_KeepsAcknowledged(t *testing.T) {
+	alertID := uuid.New()
+	repo := newMockEscalationRepo()
+	now := time.Now()
+	repo.states[alertID] = &models.EscalationState{
+		AlertID: &alertID, Status: models.EscalationStateAcknowledged, AcknowledgedAt: &now,
+	}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.MarkAlertCompleted(alertID); err != nil {
+		t.Fatal(err)
+	}
+	if got := repo.states[alertID].Status; got != models.EscalationStateAcknowledged {
+		t.Errorf("Status = %q, want acknowledged to be kept", got)
+	}
+}
+
+func TestEscalationEngine_AcknowledgeIncident_StopsIncidentEscalation(t *testing.T) {
+	incidentID := uuid.New()
+	repo := newMockEscalationRepo()
+	repo.incidentStates = map[uuid.UUID]*models.EscalationState{
+		incidentID: {IncidentID: &incidentID, SourceType: "incident", Status: models.EscalationStateNotified},
+	}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.AcknowledgeIncident(incidentID, "u1", models.AcknowledgmentViaTeams); err != nil {
+		t.Fatal(err)
+	}
+	st := repo.incidentStates[incidentID]
+	if st.Status != models.EscalationStateAcknowledged || st.AcknowledgedAt == nil ||
+		st.AcknowledgedVia == nil || *st.AcknowledgedVia != models.AcknowledgmentViaTeams {
+		t.Errorf("state not acknowledged via teams: %+v", st)
+	}
+	if err := engine.AcknowledgeIncident(incidentID, "u2", models.AcknowledgmentViaAPI); err != nil {
+		t.Fatal(err)
+	}
+	if *st.AcknowledgedBy != "u1" {
+		t.Errorf("second ack overwrote the first: by = %q", *st.AcknowledgedBy)
+	}
+}
+
+func TestEscalationEngine_IncidentEscalation_NoStateIsNoop(t *testing.T) {
+	engine := NewEscalationEngine(newMockEscalationRepo(), &mockScheduleEvaluator{}, nil)
+	if err := engine.AcknowledgeIncident(uuid.New(), "u", models.AcknowledgmentViaTeams); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.CompleteIncident(uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEscalationEngine_CompleteIncident_EndsEscalation(t *testing.T) {
+	incidentID := uuid.New()
+	repo := newMockEscalationRepo()
+	repo.incidentStates = map[uuid.UUID]*models.EscalationState{
+		incidentID: {IncidentID: &incidentID, SourceType: "incident", Status: models.EscalationStateNotified},
+	}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.CompleteIncident(incidentID); err != nil {
+		t.Fatal(err)
+	}
+	if got := repo.incidentStates[incidentID].Status; got != models.EscalationStateCompleted {
+		t.Errorf("Status = %q, want completed", got)
+	}
+}
+
+// pendingStateFixture returns an engine with one pending alert escalation that has a
+// schedule-backed tier, plus the chat mock that records pages.
+func pendingStateFixture(t *testing.T, alert *models.Alert) (*escalationEngine, *mockChatForEscalation, *mockEscalationRepo) {
+	t.Helper()
+	schedID, policyID := uuid.New(), uuid.New()
+	repo := newMockEscalationRepo()
+	repo.policies[policyID] = &models.EscalationPolicy{
+		ID: policyID, Enabled: true,
+		Tiers: []models.EscalationTier{makeTier(policyID, 0, 300, models.EscalationTargetSchedule, &schedID, nil)},
+	}
+	alert.EscalationPolicyID = &policyID
+	state := models.EscalationState{ID: uuid.New(), AlertID: &alert.ID, PolicyID: policyID, Status: models.EscalationStatePending}
+	repo.states[alert.ID] = &state
+	repo.activeStates = []models.EscalationState{state}
+
+	chat := &mockChatForEscalation{}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{onCallUser: "alice"}, chat).(*escalationEngine)
+	engine.alertLookup = func(uuid.UUID) (*models.Alert, error) { return alert, nil }
+	return engine, chat, repo
+}
+
+func TestEscalationEngine_TriggerEscalation_RestartsFinishedState(t *testing.T) {
+	policyID := uuid.New()
+	alertID := uuid.New()
+	now := time.Now()
+	repo := newMockEscalationRepo()
+	repo.policies[policyID] = &models.EscalationPolicy{ID: policyID}
+	repo.createErr = &repository.AlreadyExistsError{Resource: "escalation_state", Field: "alert_id"}
+	repo.states[alertID] = &models.EscalationState{
+		AlertID: &alertID, PolicyID: policyID, CurrentTierIndex: 2,
+		Status: models.EscalationStateCompleted, LastNotifiedAt: &now,
+	}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.TriggerEscalation(&models.Alert{ID: alertID, EscalationPolicyID: &policyID}); err != nil {
+		t.Fatal(err)
+	}
+	st := repo.states[alertID]
+	if repo.restarted != 1 || st.Status != models.EscalationStatePending || st.CurrentTierIndex != 0 || st.LastNotifiedAt != nil {
+		t.Errorf("finished state not restarted: restarted=%d state=%+v", repo.restarted, st)
+	}
+}
+
+func TestEscalationEngine_TriggerEscalation_DoesNotRestartActiveState(t *testing.T) {
+	policyID := uuid.New()
+	alertID := uuid.New()
+	repo := newMockEscalationRepo()
+	repo.policies[policyID] = &models.EscalationPolicy{ID: policyID}
+	repo.createErr = &repository.AlreadyExistsError{Resource: "escalation_state", Field: "alert_id"}
+	repo.states[alertID] = &models.EscalationState{AlertID: &alertID, PolicyID: policyID, CurrentTierIndex: 1, Status: models.EscalationStateNotified}
+	engine := NewEscalationEngine(repo, &mockScheduleEvaluator{}, nil)
+
+	if err := engine.TriggerEscalation(&models.Alert{ID: alertID, EscalationPolicyID: &policyID}); err != nil {
+		t.Fatal(err)
+	}
+	if repo.restarted != 0 || repo.states[alertID].CurrentTierIndex != 1 {
+		t.Errorf("active state must be left alone: %+v", repo.states[alertID])
+	}
+}
+
+func TestEscalationEngine_Evaluate_SkipsResolvedAlert(t *testing.T) {
+	alert := &models.Alert{ID: uuid.New(), Status: models.AlertStatusResolved}
+	engine, chat, repo := pendingStateFixture(t, alert)
+
+	if err := engine.EvaluateEscalations(); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.sentDMs) != 0 {
+		t.Errorf("resolved alert must not be paged, got %d DMs", len(chat.sentDMs))
+	}
+	if got := repo.states[alert.ID].Status; got != models.EscalationStateCompleted {
+		t.Errorf("Status = %q, want completed", got)
+	}
+}
+
+func TestEscalationEngine_Evaluate_SkipsAlertOfAcknowledgedIncident(t *testing.T) {
+	alert := &models.Alert{ID: uuid.New(), Status: models.AlertStatusFiring}
+	engine, chat, repo := pendingStateFixture(t, alert)
+	engine.incidentLookup = func(uuid.UUID) (*models.Incident, error) {
+		return &models.Incident{Status: models.IncidentStatusAcknowledged}, nil
+	}
+
+	if err := engine.EvaluateEscalations(); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.sentDMs) != 0 {
+		t.Errorf("alert of an acknowledged incident must not be paged, got %d DMs", len(chat.sentDMs))
+	}
+	if got := repo.states[alert.ID].Status; got != models.EscalationStateAcknowledged {
+		t.Errorf("Status = %q, want acknowledged", got)
+	}
+}
+
+func TestEscalationEngine_Evaluate_PagesFiringAlertWithTriggeredIncident(t *testing.T) {
+	alert := &models.Alert{ID: uuid.New(), Status: models.AlertStatusFiring}
+	engine, chat, _ := pendingStateFixture(t, alert)
+	engine.incidentLookup = func(uuid.UUID) (*models.Incident, error) {
+		return &models.Incident{Status: models.IncidentStatusTriggered}, nil
+	}
+
+	if err := engine.EvaluateEscalations(); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.sentDMs) != 1 {
+		t.Errorf("expected 1 page, got %d", len(chat.sentDMs))
 	}
 }

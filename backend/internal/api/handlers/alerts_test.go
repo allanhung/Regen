@@ -34,6 +34,10 @@ func (m *mockEscalationEngineForHandler) AcknowledgeAlert(alertID uuid.UUID, by 
 	return m.AcknowledgeAlertFn(alertID, by, via)
 }
 func (m *mockEscalationEngineForHandler) MarkAlertCompleted(alertID uuid.UUID) error { return nil }
+func (m *mockEscalationEngineForHandler) AcknowledgeIncident(_ uuid.UUID, _ string, _ models.AcknowledgmentVia) error {
+	return nil
+}
+func (m *mockEscalationEngineForHandler) CompleteIncident(_ uuid.UUID) error { return nil }
 
 // ----------------------------------------------------------------------------
 // Helper: set up DB with alerts table + escalation columns

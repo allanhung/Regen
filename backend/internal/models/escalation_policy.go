@@ -50,6 +50,7 @@ const (
 	AcknowledgmentViaSlack AcknowledgmentVia = "slack"
 	AcknowledgmentViaAPI   AcknowledgmentVia = "api"
 	AcknowledgmentViaCLI   AcknowledgmentVia = "cli"
+	AcknowledgmentViaTeams AcknowledgmentVia = "teams"
 )
 
 // AcknowledgmentStatus is the alert-level ack state, denormalized from
@@ -206,7 +207,7 @@ type EscalationState struct {
 	// AcknowledgedBy is the user_name of whoever acknowledged the alert.
 	AcknowledgedBy *string `gorm:"type:varchar(255)" json:"acknowledged_by,omitempty"`
 
-	// AcknowledgedVia records the channel used: "slack", "api", or "cli".
+	// AcknowledgedVia records the channel used: "slack", "api", "cli", or "teams".
 	AcknowledgedVia *AcknowledgmentVia `gorm:"type:varchar(50)" json:"acknowledged_via,omitempty"`
 
 	// CreatedAt is when this escalation was triggered (immutable, server-generated).

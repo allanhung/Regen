@@ -42,9 +42,10 @@ type UpdateIncidentParams struct {
 	Severity    models.IncidentSeverity
 	Summary     string
 	UpdatedBy   string
-	ClientIP    string     // For audit logging
-	AIEnabled   *bool      // Controls whether AI agents process this incident. nil = no change.
-	CommanderID *uuid.UUID // nil = no change
+	ClientIP    string                   // For audit logging
+	AIEnabled   *bool                    // Controls whether AI agents process this incident. nil = no change.
+	CommanderID *uuid.UUID               // nil = no change
+	AckVia      models.AcknowledgmentVia // Channel recorded on escalation when acknowledging; "" = api
 }
 
 // CreateTimelineEntryParams holds parameters for creating a timeline entry
@@ -116,6 +117,7 @@ type incidentService struct {
 	scheduleRepo   repository.ScheduleRepository // Optional — for on-call auto-assign
 	evaluator      ScheduleEvaluator             // Optional — for on-call auto-assign
 	pushSvc        PushNotifier                  // Optional — nil when push notifications disabled
+	escalation     EscalationEngine              // Optional — nil when escalation is not wired
 }
 
 // NewIncidentService creates a new incident service
@@ -154,6 +156,14 @@ func SetAIService(svc IncidentService, ai AIService) {
 func SetTeamsService(svc IncidentService, teams *TeamsService) {
 	if is, ok := svc.(*incidentService); ok {
 		is.teamsSvc = teams
+	}
+}
+
+// SetEscalationEngine wires the escalation engine so acknowledging or closing an
+// incident also stops the escalations of the incident and its linked alerts.
+func SetEscalationEngine(svc IncidentService, engine EscalationEngine) {
+	if is, ok := svc.(*incidentService); ok {
+		is.escalation = engine
 	}
 }
 
@@ -949,6 +959,7 @@ func (s *incidentService) UpdateIncidentStatus(id uuid.UUID, status models.Incid
 		"new_status":      string(status),
 		"actor":           actorID,
 	})
+	s.syncEscalation(id, status, actorID, escalationViaForActor(actorType))
 	if status == models.IncidentStatusResolved {
 		go publishResolved(id, incident.AIEnabled)
 		if updatedIncident, err := s.incidentRepo.GetByID(context.Background(), id); err == nil && s.teamsSvc != nil {
@@ -1212,6 +1223,13 @@ func (s *incidentService) UpdateIncident(id uuid.UUID, params *UpdateIncidentPar
 	}
 
 	statusChanged := params.Status != "" && params.Status != previousStatus
+	if statusChanged {
+		via := params.AckVia
+		if via == "" {
+			via = models.AcknowledgmentViaAPI
+		}
+		s.syncEscalation(id, params.Status, params.UpdatedBy, via)
+	}
 
 	// Post Slack notification and optionally archive channel, asynchronously
 	if statusChanged && s.chatService != nil {
@@ -1617,7 +1635,71 @@ func (s *incidentService) AcknowledgeIncident(id uuid.UUID, actorType, actorID s
 		"new_status":      string(models.IncidentStatusAcknowledged),
 		"actor":           actorID,
 	})
+	s.syncEscalation(id, models.IncidentStatusAcknowledged, actorID, escalationViaForActor(actorType))
+	// Re-fetch so the refreshed root card shows "acknowledged" and drops its Acknowledge button.
+	if updatedIncident, err := s.incidentRepo.GetByID(context.Background(), id); err == nil && s.teamsSvc != nil {
+		go func() {
+			defer recoverAsyncPanic(context.Background(), "postStatusUpdateToTeams(ack)", "incident_id", id)
+			s.postStatusUpdateToTeams(updatedIncident, incident.Status, models.IncidentStatusAcknowledged, actorID)
+		}()
+	}
 	return nil
+}
+
+// escalationViaForActor maps the actor type of a status change to the channel
+// recorded on the escalation acknowledgment.
+func escalationViaForActor(actorType string) models.AcknowledgmentVia {
+	switch actorType {
+	case "teams_bot":
+		return models.AcknowledgmentViaTeams
+	case "slack_reaction":
+		return models.AcknowledgmentViaSlack
+	default:
+		return models.AcknowledgmentViaAPI
+	}
+}
+
+// syncEscalation stops the escalations tied to an incident when its status moves
+// on: acknowledging stops them as acknowledged, resolving or canceling ends them.
+// It covers the escalation of every linked alert and the incident's own. Failures
+// are logged only — the status change has already been committed.
+func (s *incidentService) syncEscalation(incidentID uuid.UUID, status models.IncidentStatus, by string, via models.AcknowledgmentVia) {
+	if s.escalation == nil {
+		return
+	}
+	var ack bool
+	switch status {
+	case models.IncidentStatusAcknowledged:
+		ack = true
+	case models.IncidentStatusResolved, models.IncidentStatusCanceled:
+	default:
+		return
+	}
+
+	alerts, err := s.incidentRepo.GetAlerts(incidentID)
+	if err != nil {
+		slog.Error("escalation sync: failed to load incident alerts", "incident_id", incidentID, "error", err)
+	}
+	for _, alert := range alerts {
+		if ack {
+			err = s.escalation.AcknowledgeAlert(alert.ID, by, via)
+		} else {
+			err = s.escalation.MarkAlertCompleted(alert.ID)
+		}
+		if err != nil {
+			slog.Error("escalation sync: failed to update alert escalation",
+				"incident_id", incidentID, "alert_id", alert.ID, "status", status, "error", err)
+		}
+	}
+	if ack {
+		err = s.escalation.AcknowledgeIncident(incidentID, by, via)
+	} else {
+		err = s.escalation.CompleteIncident(incidentID)
+	}
+	if err != nil {
+		slog.Error("escalation sync: failed to update incident escalation",
+			"incident_id", incidentID, "status", status, "error", err)
+	}
 }
 
 // ResolveIncident transitions an incident to "resolved".
@@ -1635,6 +1717,7 @@ func (s *incidentService) ResolveIncident(id uuid.UUID, actorType, actorID strin
 		"new_status":      string(models.IncidentStatusResolved),
 		"actor":           actorID,
 	})
+	s.syncEscalation(id, models.IncidentStatusResolved, actorID, escalationViaForActor(actorType))
 	// Publish event for AICoordinator (Post-Mortem Agent et al.)
 	go publishResolved(id, incident.AIEnabled)
 	// Re-fetch with updated status so postStatusUpdateToTeams sees the correct state.

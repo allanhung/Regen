@@ -236,6 +236,16 @@ func (s *alertService) processNormalizedAlerts(ctx context.Context, alerts []web
 		} else {
 			result.Updated++
 		}
+		// A resolved alert ends its own escalation, whether or not an incident
+		// is linked to it. Deferred so it runs against committed state.
+		if !created && alert.Status == models.AlertStatusResolved && s.escalationEngine != nil {
+			alertID := alert.ID
+			s.afterCommit(func() {
+				if err := s.escalationEngine.MarkAlertCompleted(alertID); err != nil {
+					slog.ErrorContext(ctx, "failed to complete escalation for resolved alert", "alert_id", alertID, "err", err)
+				}
+			})
+		}
 		needsIncident := created
 		if is, ok := s.incidentSvc.(*incidentService); ok {
 			var err error

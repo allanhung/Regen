@@ -14,6 +14,7 @@ import (
 	"github.com/FluidifyAI/Regen/backend/internal/observability"
 	"github.com/FluidifyAI/Regen/backend/internal/repository"
 	"github.com/FluidifyAI/Regen/backend/internal/services"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -125,6 +126,16 @@ func (w *EscalationWorker) tick() {
 // If chatService is nil, the call is a no-op (Slack not configured).
 // alert may be nil for incident-sourced escalations.
 func (w *EscalationWorker) SendEscalationDM(userID string, alert *models.Alert, tierIndex int) error {
+	return w.sendEscalationDM(userID, alert, nil, tierIndex)
+}
+
+// SendIncidentEscalationDM implements services.IncidentEscalationNotifier: the page for
+// an incident-sourced escalation, whose Teams card carries the incident's action buttons.
+func (w *EscalationWorker) SendIncidentEscalationDM(userID string, incidentID uuid.UUID, tierIndex int) error {
+	return w.sendEscalationDM(userID, nil, &incidentID, tierIndex)
+}
+
+func (w *EscalationWorker) sendEscalationDM(userID string, alert *models.Alert, incidentID *uuid.UUID, tierIndex int) error {
 	// No ctx to thread a span through here (see the tracer field's doc
 	// comment) — a fresh root span, tagged with whether a page actually went
 	// out, is what the collector's tail-sampling policy (REG-15) matches on
@@ -149,7 +160,11 @@ func (w *EscalationWorker) SendEscalationDM(userID string, alert *models.Alert, 
 
 	chatStart := time.Now()
 	msg := w.msgBuilder.BuildEscalationDMMessage(alert, tierIndex)
-	msg.TeamsCard = services.TeamsEscalationCard(alert, tierIndex, appBaseURL())
+	if alert == nil && incidentID != nil {
+		msg.TeamsCard = services.TeamsIncidentEscalationCard(*incidentID, tierIndex, appBaseURL())
+	} else {
+		msg.TeamsCard = services.TeamsEscalationCard(alert, tierIndex, appBaseURL())
+	}
 	err := w.chatService.SendDirectMessage(userID, msg)
 	metrics.NotificationSendDurationSeconds.WithLabelValues("chat").Observe(time.Since(chatStart).Seconds())
 	if err != nil {

@@ -116,6 +116,9 @@ func (s *incidentService) reconcileAlert(ctx context.Context, alert *models.Aler
 			return false, fmt.Errorf("reconcile incident %s: %w", incident.ID, err)
 		}
 		s.afterCommit(func() {
+			s.syncEscalation(incident.ID, models.IncidentStatusResolved, "alertmanager", models.AcknowledgmentViaAPI)
+		})
+		s.afterCommit(func() {
 			bgCtx := context.WithoutCancel(ctx)
 			go func() {
 				defer recoverAsyncPanic(bgCtx, "notifyAutomaticResolution", "incident_id", incident.ID)
