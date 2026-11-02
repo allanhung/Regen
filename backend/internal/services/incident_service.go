@@ -1829,10 +1829,7 @@ func (s *incidentService) createTeamsChannelForIncident(incident *models.Inciden
 	// Requires teams_user_id (Teams user ID, "29:...") set on the user record.
 	// Skipped silently if: no schedule configured, no one on-call, or no teams_user_id.
 	if aadID := s.findOnCallTeamsUserID(); aadID != nil {
-		appURL := os.Getenv("SAML_BASE_URL")
-		if appURL == "" {
-			appURL = "http://localhost:8080"
-		}
+		appURL := teamsAppURL()
 		if err := s.teamsSvc.SendOnCallDM(*aadID, incident, appURL); err != nil {
 			slog.Warn("teams: failed to send on-call DM",
 				"incident_id", incident.ID,
@@ -1936,6 +1933,17 @@ func (s *incidentService) launchChannelCreation(incident *models.Incident, alert
 //   - UpdateConversationMessage refreshes the root incident card in-place
 //   - PostToConversation posts a new status notification card
 func (s *incidentService) postStatusUpdateToTeams(incident *models.Incident, previousStatus, newStatus models.IncidentStatus, updatedBy string) {
+	// DM the responders first: it must not depend on the conversation having been
+	// stored or on the status card posting successfully. Own goroutine so the DMs
+	// (two HTTP calls per recipient) do not delay the channel update below.
+	if newStatus == models.IncidentStatusResolved {
+		inc := *incident
+		go func() {
+			defer recoverAsyncPanic(context.Background(), "notifyResolvedViaTeamsDM", "incident_id", inc.ID)
+			s.notifyResolvedViaTeamsDM(&inc, updatedBy)
+		}()
+	}
+
 	if incident.TeamsConversationID == nil {
 		// Pre-v0.9 incident without a stored conversationID — skip silently.
 		// Channel was created but Bot Framework posting was not yet implemented.
@@ -1966,5 +1974,107 @@ func (s *incidentService) postStatusUpdateToTeams(incident *models.Incident, pre
 	isTerminal := newStatus == models.IncidentStatusResolved || newStatus == models.IncidentStatusCanceled
 	if isTerminal && incident.TeamsChannelID != nil {
 		_ = s.teamsSvc.ArchiveChannel(*incident.TeamsChannelID)
+	}
+}
+
+// teamsAppURL is the public base URL used for links in Teams cards.
+func teamsAppURL() string {
+	if u := os.Getenv("SAML_BASE_URL"); u != "" {
+		return u
+	}
+	return "http://localhost:8080"
+}
+
+// resolvedDMDedupeTTL bounds how long a resolved incident's DM claim is remembered.
+const resolvedDMDedupeTTL = 24 * time.Hour
+
+// claimResolvedDM reports whether this caller should send the resolved DMs for the
+// incident. Several resolve paths can race (Alertmanager auto-resolve vs. a manual
+// resolve, Slack vs. Teams) and none of them is serialised, so the first to set the
+// Redis key wins. Without Redis, or if it errors, the DMs are sent: a duplicate DM is
+// better than none.
+func claimResolvedDM(incidentID uuid.UUID) bool {
+	if appredis.Client == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	won, err := appredis.Client.SetNX(ctx, "resolved-dm:"+incidentID.String(), "1", resolvedDMDedupeTTL).Result()
+	if err != nil {
+		slog.Warn("teams: resolved DM dedupe check failed, sending anyway", "incident_id", incidentID, "error", err)
+		return true
+	}
+	return won
+}
+
+// isResolverUser reports whether actor (as passed down the resolve path) identifies user.
+// Actor formats differ per path: user UUID or display name (API, Slack command), a Slack
+// member ID (reaction), a Teams "29:..." ID (Teams bot) or "alertmanager" (auto-resolve).
+func isResolverUser(user *models.User, teamsMember, actor string) bool {
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		return false
+	}
+	if actor == user.ID.String() || strings.EqualFold(actor, user.Name) || strings.EqualFold(actor, user.Email) {
+		return true
+	}
+	if user.SlackUserID != nil && *user.SlackUserID != "" && actor == *user.SlackUserID {
+		return true
+	}
+	return teamsMemberID(actor) == teamsMember
+}
+
+// resolvedDMRecipientsFor returns the teams_user_id of the on-call responder and the
+// incident commander, without duplicates, without users lacking a teams_user_id and
+// without the user who resolved the incident.
+func (s *incidentService) resolvedDMRecipientsFor(incident *models.Incident, onCallUserID *uuid.UUID, resolvedBy string) []string {
+	if s.userRepo == nil {
+		return nil
+	}
+	var candidates []uuid.UUID
+	if onCallUserID != nil {
+		candidates = append(candidates, *onCallUserID)
+	}
+	if incident.CommanderID != nil && *incident.CommanderID != uuid.Nil {
+		candidates = append(candidates, *incident.CommanderID)
+	}
+
+	seenUsers := make(map[uuid.UUID]bool)
+	seenMembers := make(map[string]bool)
+	var recipients []string
+	for _, id := range candidates {
+		if seenUsers[id] {
+			continue
+		}
+		seenUsers[id] = true
+		user, err := s.userRepo.GetByID(id)
+		if err != nil || user == nil || user.TeamsUserID == nil || strings.TrimSpace(*user.TeamsUserID) == "" {
+			continue
+		}
+		member := teamsMemberID(*user.TeamsUserID)
+		if seenMembers[member] || isResolverUser(user, member, resolvedBy) {
+			continue
+		}
+		seenMembers[member] = true
+		recipients = append(recipients, *user.TeamsUserID)
+	}
+	return recipients
+}
+
+// notifyResolvedViaTeamsDM DMs the current on-call responder and the incident commander
+// that the incident was resolved. Failures are logged, never returned.
+func (s *incidentService) notifyResolvedViaTeamsDM(incident *models.Incident, resolvedBy string) {
+	if s.teamsSvc == nil || !claimResolvedDM(incident.ID) {
+		return
+	}
+	recipients := s.resolvedDMRecipientsFor(incident, s.findOnCallUserID(), resolvedBy)
+	appURL := teamsAppURL()
+	for _, teamsUserID := range recipients {
+		if err := s.teamsSvc.SendResolvedDM(teamsUserID, incident, resolvedBy, appURL); err != nil {
+			slog.Warn("teams: failed to send resolved DM",
+				"incident_id", incident.ID, "teams_user_id", teamsUserID, "error", err)
+		} else {
+			slog.Info("teams: resolved DM sent", "incident_id", incident.ID, "teams_user_id", teamsUserID)
+		}
 	}
 }

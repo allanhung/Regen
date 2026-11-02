@@ -279,6 +279,21 @@ func (s *TeamsService) SendOnCallDM(teamsUserID string, incident *models.Inciden
 	return s.sendDM(teamsUserID, activity)
 }
 
+// SendResolvedDM sends a proactive Adaptive Card DM telling a responder that an incident
+// was resolved. teamsUserID has the same accepted forms as for SendOnCallDM.
+func (s *TeamsService) SendResolvedDM(teamsUserID string, incident *models.Incident, resolvedBy, appURL string) error {
+	activity := map[string]interface{}{
+		"type": "message",
+		"attachments": []map[string]interface{}{
+			{
+				"contentType": "application/vnd.microsoft.card.adaptive",
+				"content":     teamsResolvedDMCard(incident, resolvedBy, appURL),
+			},
+		},
+	}
+	return s.sendDM(teamsUserID, activity)
+}
+
 // sendDM opens a 1:1 conversation with the user and posts the activity to it.
 func (s *TeamsService) sendDM(teamsUserID string, activity map[string]interface{}) error {
 	createURL := fmt.Sprintf("%sv3/conversations", s.serviceURL)
